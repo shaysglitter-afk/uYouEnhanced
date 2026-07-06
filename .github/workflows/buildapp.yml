@@ -93,7 +93,7 @@ jobs:
           path: theos/sdks/
           key: iOS-${{ inputs.sdk_version }}-SDK
 
-      - name: Download iOS SDK (if cache miss)
+      - name: Download iOS SDK
         if: steps.SDK.outputs.cache-hit != 'true'
         run: |
           git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/aricloverALT/sdks/ sdks
@@ -137,18 +137,17 @@ jobs:
           git clone --quiet --depth=1 https://code.videolan.org/videolan/dav1d.git $THEOS/vendor/dav1d
           git clone --quiet --depth=1 https://chromium.googlesource.com/webm/libvpx $THEOS/vendor/libvpx
           git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git YTUHD
-        env:
-          THEOS: ${{ github.workspace }}/theos
+
+      - name: Hash YT ipa url
+        run: |
+          URL_YT="$(jq -r '.inputs.decrypted_youtube_url' $GITHUB_EVENT_PATH)"
+          echo ::add-mask::$URL_YT
+          echo URL_YT=$URL_YT >> $GITHUB_ENV
 
       - name: Prepare YouTube iPA
         id: prepare_youtube
         run: |
-          set -e
-          if [ -z "${{ github.event.inputs.decrypted_youtube_url }}" ]; then
-            echo "No decrypted_youtube_url provided"
-            exit 1
-          fi
-          wget "${{ github.event.inputs.decrypted_youtube_url }}" --quiet -O main/YouTube.ipa
+          wget "$YOUTUBE_URL" --quiet -O main/YouTube.ipa
           cd main
           mv YouTube.ipa YouTube.zip
           unzip -q YouTube.zip
@@ -156,25 +155,27 @@ jobs:
           echo "YT_VERSION=$youtube_version" >> $GITHUB_ENV
           echo "youtube_version=${youtube_version}" >> $GITHUB_OUTPUT
 
+        env:
+          YOUTUBE_URL: ${{ env.URL_YT }}
+
       - name: Fix compiling & Build Package
         id: build_package
         run: |
-          set -e
           cd main
-          # Use portable replacements on macOS runner; if sed replace fails, append fallback lines.
-          perl -0777 -pe "s/^BUNDLE_ID\s*=.*$/BUNDLE_ID = ${{ inputs.bundle_id }}/m" -i Makefile || echo "BUNDLE_ID = ${{ inputs.bundle_id }}" >> Makefile
-          perl -0777 -pe "s/^DISPLAY_NAME\s*=.*$/DISPLAY_NAME = ${{ inputs.app_name }}/m" -i Makefile || echo "DISPLAY_NAME = ${{ inputs.app_name }}" >> Makefile
-          perl -0777 -pe "s/^export TARGET\s*=.*$/export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0/m" -i Makefile || echo "export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0" >> Makefile
-
+          sed -i '' "s/^BUNDLE_ID .*/BUNDLE_ID = ${{ inputs.bundle_id }}/" Makefile || echo "BUNDLE_ID = ${{ inputs.bundle_id }}" >> Makefile
+          sed -i '' "s/^DISPLAY_NAME .*/DISPLAY_NAME = ${{ inputs.app_name }}/" Makefile || echo "DISPLAY_NAME = ${{ inputs.app_name }}" >> Makefile
+          sed -i '' "s/^export TARGET .*/export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0/" Makefile || echo "export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0" >> Makefile
+          
+          # YTUHD flag
           if [ "${{ inputs.ytuhd }}" = "true" ]; then
-            grep -q '^YTUHD_ENABLED=1' Makefile || echo "YTUHD_ENABLED=1" >> Makefile
+            echo "YTUHD_ENABLED=1" >> Makefile
           else
-            grep -q '^YTUHD_ENABLED=0' Makefile || echo "YTUHD_ENABLED=0" >> Makefile
+            echo "YTUHD_ENABLED=0" >> Makefile
           fi
-
-          # Export the SDK override to the Makefile build environment
+          
           make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1
           echo "package=$(ls -t packages | head -n1)" >> $GITHUB_OUTPUT
+
         env:
           THEOS: ${{ github.workspace }}/theos
 
@@ -188,14 +189,83 @@ jobs:
 
       - name: Normalize Extension Bundle ID for SideStore
         run: |
+          set -euo pipefail
+
           PARENT_BUNDLE="${{ inputs.bundle_id }}"
+          ORIG_PREFIX="com.google.ios.youtube"
+
+          echo "Normalizing extension CFBundleIdentifier(s) to use parent prefix: ${PARENT_BUNDLE}"
+
+          update_plist_id() {
+            PLIST_PATH="$1"
+            if [ ! -f "$PLIST_PATH" ]; then
+              return
+            fi
+            if /usr/bin/plutil -convert xml1 "$PLIST_PATH" >/dev/null 2>&1; then
+              :
+            fi
+            CURRENT_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST_PATH" 2>/dev/null || true)
+            if [ -z "$CURRENT_ID" ]; then
+              return
+            fi
+            if [[ "$CURRENT_ID" == "$ORIG_PREFIX"* ]]; then
+              SUFFIX="${CURRENT_ID#${ORIG_PREFIX}.}"
+              if [ "$SUFFIX" = "$CURRENT_ID" ]; then
+                SUFFIX="Extension"
+              fi
+              NEW_ID="${PARENT_BUNDLE}.${SUFFIX}"
+              echo "Updating $PLIST_PATH: $CURRENT_ID -> $NEW_ID"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NEW_ID" "$PLIST_PATH" || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $NEW_ID" "$PLIST_PATH" || true
+            else
+              echo "Skipping $PLIST_PATH (does not start with $ORIG_PREFIX): $CURRENT_ID"
+            fi
+          }
+
           for appex in *.appex; do
-            if [ -f "$appex/Info.plist" ]; then
-              EXT_ID="${PARENT_BUNDLE}.Extension"
-              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $EXT_ID" "$appex/Info.plist" 2>/dev/null || true
-              echo "Set extension ID: $EXT_ID"
+            if [ -d "$appex" ]; then
+              PLIST="$appex/Info.plist"
+              update_plist_id "$PLIST"
+              find "$appex" -type f -name "*.plist" -o -name "*.entitlements" | while read -r f; do
+                /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+                if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                  echo "Replacing occurrences in $f"
+                  perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+                fi
+              done
             fi
           done
+
+          APP_PLUGINS_DIR="main/Payload/YouTube.app/PlugIns"
+          if [ -d "$APP_PLUGINS_DIR" ]; then
+            for appex in "$APP_PLUGINS_DIR"/*.appex; do
+              if [ -d "$appex" ]; then
+                PLIST="$appex/Info.plist"
+                update_plist_id "$PLIST"
+                find "$appex" -type f -name "*.plist" -o -name "*.entitlements" | while read -r f; do
+                  /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+                  if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                    echo "Replacing occurrences in $f"
+                    perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+                  fi
+                done
+              fi
+            done
+          fi
+
+          MAIN_APP_DIR="main/Payload/YouTube.app"
+          if [ -d "$MAIN_APP_DIR" ]; then
+            find "$MAIN_APP_DIR" -type f -name "*.plist" -o -name "*.entitlements" | while read -r f; do
+              /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+              if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                echo "Replacing occurrences in $f"
+                perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+              fi
+            done
+          fi
+
+          echo "Normalization complete."
+        shell: bash
 
       - name: Inject Tweaks Into IPA
         run: |
