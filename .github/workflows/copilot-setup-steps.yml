@@ -185,7 +185,7 @@ jobs:
           - `system/environment.log` - System and tool versions
           - `build/obj_structure.log` - Build object directory structure
           - `build/packages_list.log` - Generated packages list
-          - `build/sources.log` - Source file statistics
+          
           
           **For Copilot Analysis**: Check the organized logs above for setup validation and artifact information.
           EOF
